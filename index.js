@@ -19,7 +19,7 @@ const MIN_SOL = Number(process.env.MIN_ALERT_SOL || 0.01);
 const MIN_TOKEN = Number(process.env.MIN_ALERT_TOKEN || 1);
 
 const LOGO =
-  "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
+  "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
 
 /* ================= CMC ================= */
 
