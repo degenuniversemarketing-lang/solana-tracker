@@ -19,7 +19,7 @@ const MIN_AMOUNT_SOL = 0.01;
 const MIN_AMOUNT_USDT = 1;
 const MIN_AMOUNT_USDC = 1;
 
-const LOGO_URL = "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
+const LOGO_URL = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
 const CMC_API_KEY = process.env.CMC_API_KEY;
 
 const processedSignatures = new Set();
