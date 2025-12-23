@@ -19,7 +19,7 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MIN_AMOUNT = 1;
 const CHECK_INTERVAL = 15000;
 
-const LOGO_URL = "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
+const LOGO_URL = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
 
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 
