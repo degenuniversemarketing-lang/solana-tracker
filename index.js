@@ -5,29 +5,54 @@ require("dotenv").config();
 
 /* ================= CONFIG ================= */
 
-const RPC = "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
-const connection = new Connection(RPC, "confirmed");
+const RPC =
+  "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
 
+const connection = new Connection(RPC, "confirmed");
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+
 const CHAT_IDS = process.env.CHAT_IDS.split(",");
 const WALLET = new PublicKey(process.env.WALLET_ADDRESS);
 
-const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15000);
+const MIN_SOL = Number(process.env.MIN_ALERT_SOL || 0.01);
+const MIN_TOKEN = Number(process.env.MIN_ALERT_TOKEN || 1);
 
-const LOGO_URL = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
-const CMC_API_KEY = process.env.CMC_API_KEY;
+const LOGO =
+  "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
 
-const CHECK_INTERVAL = 15000;
-const MIN_AMOUNT = 1;
+/* ================= CMC ================= */
 
-let lastSignature = null;
-let priceCache = {};
+const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 
-/* ================= PRICE (CACHED) ================= */
+const priceCache = {};
+const PRICE_TTL = 60_000;
+
+/* ================= TOKENS ================= */
+
+const TOKENS = {
+  SOL: { symbol: "SOL" },
+  USDT: {
+    mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+    decimals: 6
+  },
+  USDC: {
+    mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    decimals: 6
+  }
+};
+
+/* ================= STATE ================= */
+
+const seenTx = new Set();
+const alertQueue = [];
+let sending = false;
+let scanning = false;
+
+/* ================= PRICE ================= */
 
 async function getPrice(symbol) {
-  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < 120000)
+  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL)
     return priceCache[symbol].price;
 
   try {
@@ -35,8 +60,7 @@ async function getPrice(symbol) {
       "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
       {
         headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
-        params: { symbol, convert: "USD" },
-        timeout: 8000
+        params: { symbol, convert: "USD" }
       }
     );
 
@@ -48,89 +72,136 @@ async function getPrice(symbol) {
   }
 }
 
-/* ================= ALERT ================= */
+/* ================= ALERT QUEUE ================= */
 
-async function sendAlert(token, amount, tx) {
-  const price = await getPrice(token);
-  const usd = (amount * price).toFixed(2);
+async function processQueue() {
+  if (sending || alertQueue.length === 0) return;
 
-  const msg = `
+  sending = true;
+  const job = alertQueue.shift();
+
+  const price = await getPrice(job.symbol);
+  const usd = job.amount * price;
+
+  const caption = `
 🚨 <b>New Buy Alert!</b>
 
-💰 <b>${amount.toFixed(4)} ${token}</b>
-💵 <b>$${usd}</b>
+💰 <b>${job.amount.toFixed(4)} ${job.symbol}</b>
+💵 <b>$${usd.toFixed(2)} USD</b>
 
-🔗 <a href="https://solscan.io/tx/${tx}">View Transaction</a>
+🔗 <a href="https://solscan.io/tx/${job.tx}">View Transaction</a>
 `.trim();
 
-  for (const id of CHAT_IDS) {
-    await bot.sendPhoto(id, LOGO_URL, {
-      caption: msg,
-      parse_mode: "HTML"
-    });
+  for (const chat of CHAT_IDS) {
+    try {
+      await bot.sendPhoto(chat, LOGO, {
+        caption,
+        parse_mode: "HTML"
+      });
+      await new Promise(r => setTimeout(r, 1200)); // HARD RATE LIMIT
+    } catch (e) {
+      console.log("Telegram error:", e.message);
+    }
   }
 
-  console.log(`✅ Alert sent: ${amount} ${token}`);
+  sending = false;
+  processQueue();
 }
 
-/* ================= TX SCAN ================= */
+function enqueueAlert(amount, symbol, tx) {
+  alertQueue.push({ amount, symbol, tx });
+  processQueue();
+}
 
-async function scanIncoming() {
-  try {
-    const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 5 });
+/* ================= SOL SCAN ================= */
 
-    for (const s of sigs) {
-      if (s.signature === lastSignature) break;
+async function scanSOL() {
+  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 5 });
 
-      const tx = await connection.getParsedTransaction(s.signature, {
-        maxSupportedTransactionVersion: 0
-      });
+  for (const sig of sigs) {
+    if (seenTx.has(sig.signature)) continue;
 
-      if (!tx?.meta) continue;
+    const tx = await connection.getParsedTransaction(sig.signature, {
+      maxSupportedTransactionVersion: 0
+    });
+    if (!tx) continue;
 
-      /* -------- SOL -------- */
-      const pre = tx.meta.preBalances[0];
-      const post = tx.meta.postBalances[0];
-      const solDiff = (post - pre) / LAMPORTS_PER_SOL;
+    const pre = tx.meta?.preBalances[0] || 0;
+    const post = tx.meta?.postBalances[0] || 0;
+    const diff = (post - pre) / LAMPORTS_PER_SOL;
 
-      if (solDiff >= MIN_AMOUNT) {
-        await sendAlert("SOL", solDiff, s.signature);
-      }
+    if (diff >= MIN_SOL) {
+      seenTx.add(sig.signature);
+      enqueueAlert(diff, "SOL", sig.signature);
+    }
+  }
+}
 
-      /* -------- TOKENS -------- */
-      const changes = tx.meta.postTokenBalances || [];
-      for (const c of changes) {
-        if (c.owner !== WALLET.toBase58()) continue;
+/* ================= TOKEN SCAN ================= */
 
-        const mint = c.mint;
-        const amount = c.uiTokenAmount.uiAmount || 0;
+async function scanToken(symbol, mint, decimals) {
+  const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, {
+    mint
+  });
+  if (!accounts.value.length) return;
 
-        if (amount < MIN_AMOUNT) continue;
+  const tokenAcc = new PublicKey(accounts.value[0].pubkey);
+  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 5 });
 
-        if (mint === USDT_MINT) {
-          await sendAlert("USDT", amount, s.signature);
-        }
+  for (const sig of sigs) {
+    if (seenTx.has(sig.signature)) continue;
 
-        if (mint === USDC_MINT) {
-          await sendAlert("USDC", amount, s.signature);
+    const tx = await connection.getParsedTransaction(sig.signature, {
+      maxSupportedTransactionVersion: 0
+    });
+    if (!tx) continue;
+
+    const instructions = [
+      ...tx.transaction.message.instructions,
+      ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
+    ];
+
+    for (const ix of instructions) {
+      if (
+        ix.program === "spl-token" &&
+        ix.parsed?.type === "transfer" &&
+        ix.parsed.info.destination === tokenAcc.toString()
+      ) {
+        const amount =
+          Number(ix.parsed.info.amount) / Math.pow(10, decimals);
+
+        if (amount >= MIN_TOKEN) {
+          seenTx.add(sig.signature);
+          enqueueAlert(amount, symbol, sig.signature);
+          break;
         }
       }
     }
-
-    lastSignature = sigs[0]?.signature || lastSignature;
-  } catch {
-    // SILENT — no spam, no crash
   }
 }
 
-/* ================= TEST COMMAND ================= */
+/* ================= LOOP ================= */
 
-bot.onText(/\/test/, async (msg) => {
-  await sendAlert("USDT", 123.45, "test_tx_hash");
+async function loop() {
+  if (scanning) return;
+  scanning = true;
+
+  try {
+    await scanSOL();
+    await scanToken("USDT", TOKENS.USDT.mint, TOKENS.USDT.decimals);
+    await scanToken("USDC", TOKENS.USDC.mint, TOKENS.USDC.decimals);
+  } catch (e) {
+    console.log("Scan error:", e.message);
+  }
+
+  scanning = false;
+}
+
+console.log("🚀 SOL + USDT + USDC Tracker Running (USD enabled)");
+setInterval(loop, CHECK_INTERVAL);
+
+/* ================= TEST ================= */
+
+bot.onText(/\/test/, () => {
+  enqueueAlert(500, "USDT", "test_tx");
 });
-
-/* ================= START ================= */
-
-console.log("🚀 Incoming SOL + USDT + USDC Tracker Running");
-
-setInterval(scanIncoming, CHECK_INTERVAL);
