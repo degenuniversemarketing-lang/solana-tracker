@@ -6,7 +6,7 @@ require("dotenv").config();
 /* ================= CONFIG ================= */
 
 const RPC =
-  "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
+  "https://young-restless-market.solana-mainnet.quiknode.pro/bb6affad416ecf818dfa14848a919d242417c783/";
 
 const connection = new Connection(RPC, "confirmed");
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
