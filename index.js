@@ -1,139 +1,160 @@
-require('dotenv').config();
-const { Connection, PublicKey } = require('@solana/web3.js');
+const { Connection, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+require('dotenv').config();
 
-// === CONFIG ===
-const config = {
-  RPC_URL: process.env.RPC_URL,                
-  TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN, 
-  CHAT_IDS: process.env.CHAT_IDS?.split(',') || [],
-  WALLET_ADDRESS: process.env.WALLET_ADDRESS,
-  USDT_MINT: process.env.USDT_MINT,
-  LOGO_URL: 'https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg',
-  LOGO_PATH: path.join(__dirname, 'usdt_logo.jpg'),
-  CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL || '15000', 10),
-  MIN_ALERT_AMOUNT: parseFloat(process.env.MIN_ALERT_AMOUNT || '1.0'),
-  CMC_API_KEY: '27cd7244e4574e70ad724a5feef7ee10',
-};
+/* ================= CONFIG ================= */
 
-const bot = new TelegramBot(config.TELEGRAM_TOKEN);
-const connection = new Connection(config.RPC_URL);
-let lastTx = null;
+const RPC_URL = "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
+const connection = new Connection(RPC_URL, "confirmed");
 
-// ================= IMAGE DOWNLOAD =================
-async function downloadLogo() {
-  if (!fs.existsSync(config.LOGO_PATH)) {
-    try {
-      const res = await axios.get(config.LOGO_URL, { responseType: 'arraybuffer' });
-      fs.writeFileSync(config.LOGO_PATH, Buffer.from(res.data));
-      console.log('✅ Logo downloaded');
-    } catch (err) {
-      console.error('❌ Failed to download logo:', err.message);
-    }
-  } else {
-    console.log('✅ Logo already exists, skipping download');
-  }
-}
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
-// ================= CMC PRICE =================
-async function getUSDTPriceUSD() {
+const CHAT_IDS = process.env.CHAT_IDS.split(',');
+const WALLET = process.env.WALLET_ADDRESS;
+
+const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+const CHECK_INTERVAL = 15000;
+const MIN_AMOUNT = 1;
+
+const LOGO_URL = "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
+
+const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
+
+/* ================= STATE ================= */
+
+const processedSignatures = new Set();
+const MAX_SIG_CACHE = 2000;
+
+let priceCache = { SOL: 0, USDT: 1, USDC: 1, ts: 0 };
+
+/* ================= PRICE (SAFE) ================= */
+
+async function getPrices() {
+  if (Date.now() - priceCache.ts < 60000) return priceCache;
+
   try {
     const res = await axios.get(
-      'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest',
+      "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
       {
-        headers: { 'X-CMC_PRO_API_KEY': config.CMC_API_KEY },
-        params: { symbol: 'USDT', convert: 'USD' }
+        headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
+        params: { symbol: "SOL,USDT,USDC", convert: "USD" }
       }
     );
-    return res.data.data.USDT.quote.USD.price || 1;
-  } catch (err) {
-    console.error('⚠️ Failed to fetch USDT price:', err.message);
-    return 1;
-  }
+
+    priceCache = {
+      SOL: res.data.data.SOL.quote.USD.price,
+      USDT: 1,
+      USDC: 1,
+      ts: Date.now()
+    };
+  } catch {}
+
+  return priceCache;
 }
 
-// ================= TELEGRAM ALERT =================
-async function sendAlert(amount, usdValue, txHash) {
-  const caption = `🚨 New Buy Alert!
+/* ================= ALERT ================= */
 
-💰 ${amount.toFixed(4)} USDT ( $${usdValue.toFixed(2)} )
+async function sendAlert(type, amount, sig) {
+  const prices = await getPrices();
+  const usd = (amount * prices[type]).toFixed(2);
 
-🔗 View Transaction: https://solscan.io/tx/${txHash}`;
+  const caption = `
+🚨 <b>New Buy Alert!</b>
 
-  try {
-    const logo = fs.createReadStream(config.LOGO_PATH);
-    await Promise.all(config.CHAT_IDS.map(async chatId => {
-      try {
-        await bot.sendPhoto(chatId, logo, { caption });
-        console.log(`✅ Alert sent to ${chatId}`);
-      } catch (err) {
-        console.error(`❌ Telegram error for ${chatId}:`, err.message);
-      }
-    }));
-  } catch (err) {
-    console.error('❌ Error reading logo file:', err.message);
+💰 <b>${amount.toFixed(4)} ${type}</b> ( $${usd} )
+
+🔗 <a href="https://solscan.io/tx/${sig}">View Transaction</a>
+`.trim();
+
+  for (const chat of CHAT_IDS) {
+    try {
+      await bot.sendPhoto(chat, LOGO_URL, {
+        caption,
+        parse_mode: "HTML"
+      });
+    } catch {
+      await bot.sendMessage(chat, caption, { parse_mode: "HTML" });
+    }
   }
+
+  console.log(`✅ ${type} alert: ${amount}`);
 }
 
-// ================= CHECK INCOMING USDT =================
-async function checkIncomingUSDT() {
+/* ================= CORE SCAN ================= */
+
+async function scan() {
   try {
     const sigs = await connection.getSignaturesForAddress(
-      new PublicKey(config.WALLET_ADDRESS),
-      { limit: 1 }
+      new PublicKey(WALLET),
+      { limit: 15 }
     );
-    const sig = sigs[0]?.signature;
-    if (!sig || sig === lastTx) return;
-    lastTx = sig;
 
-    const tx = await connection.getTransaction(sig, { commitment: 'confirmed', encoding: 'jsonParsed' });
-    if (!tx?.meta?.postTokenBalances) return;
+    for (const s of sigs) {
+      if (processedSignatures.has(s.signature)) continue;
 
-    const usdtPrice = await getUSDTPriceUSD();
+      processedSignatures.add(s.signature);
+      if (processedSignatures.size > MAX_SIG_CACHE)
+        processedSignatures.delete(processedSignatures.values().next().value);
 
-    for (let token of tx.meta.postTokenBalances) {
-      if (token.mint === config.USDT_MINT) {
-        const amount = parseFloat(token.uiTokenAmount.amount) / Math.pow(10, token.uiTokenAmount.decimals);
-        if (amount >= config.MIN_ALERT_AMOUNT) {
-          const usdValue = amount * usdtPrice;
-          sendAlert(amount, usdValue, sig);
-        }
+      const tx = await connection.getParsedTransaction(s.signature, {
+        maxSupportedTransactionVersion: 0
+      });
+
+      if (!tx || !tx.meta) continue;
+
+      /* ===== SOL ===== */
+      const solDiff =
+        (tx.meta.postBalances[0] - tx.meta.preBalances[0]) /
+        LAMPORTS_PER_SOL;
+
+      if (solDiff >= MIN_AMOUNT) {
+        await sendAlert("SOL", solDiff, s.signature);
+      }
+
+      /* ===== TOKEN TRANSFERS (PER INSTRUCTION) ===== */
+      const instructions = [
+        ...(tx.transaction.message.instructions || []),
+        ...(tx.meta.innerInstructions || []).flatMap(i => i.instructions)
+      ];
+
+      for (const ix of instructions) {
+        if (
+          ix.program !== "spl-token" ||
+          ix.parsed?.type !== "transfer"
+        ) continue;
+
+        if (ix.parsed.info.destination !== WALLET) continue;
+
+        const mint = ix.parsed.info.mint;
+        const amount =
+          Number(ix.parsed.info.amount) /
+          (mint === USDT_MINT || mint === USDC_MINT ? 1e6 : 1);
+
+        if (amount < MIN_AMOUNT) continue;
+
+        if (mint === USDT_MINT)
+          await sendAlert("USDT", amount, s.signature);
+
+        if (mint === USDC_MINT)
+          await sendAlert("USDC", amount, s.signature);
       }
     }
-  } catch (err) {
-    console.error('❌ Error checking USDT tx:', err.message);
-  }
+  } catch {}
 }
 
-// ================= /test COMMAND =================
-function listenForTestCommand() {
-  let offset = null;
-  console.log('🤖 Listening for /test command...');
-  setInterval(async () => {
-    try {
-      const res = await axios.get(`https://api.telegram.org/bot${config.TELEGRAM_TOKEN}/getUpdates${offset ? `?offset=${offset}` : ''}`);
-      const updates = res.data.result || [];
-      for (let update of updates) {
-        offset = update.update_id + 1;
-        if (update.message?.text === '/test') {
-          const price = await getUSDTPriceUSD();
-          // Send alert using the same template as live transactions
-          sendAlert(500, 500 * price, 'TEST_TX');
-        }
-      }
-    } catch (err) {
-      console.error('❌ Telegram listener error:', err.message);
-    }
-  }, 5000);
-}
+/* ================= LOOP ================= */
 
-// ================= MAIN =================
-(async () => {
-  await downloadLogo();
-  console.log('🚀 USDT Tracker Online');
-  listenForTestCommand();
-  setInterval(checkIncomingUSDT, config.CHECK_INTERVAL);
-})();
+setInterval(scan, CHECK_INTERVAL);
+
+/* ================= TEST ================= */
+
+bot.onText(/\/test/, async msg => {
+  await sendAlert("USDT", 123.4567, "TEST_TX_HASH");
+});
+
+/* ================= START ================= */
+
+console.log("🚀 SOL + USDT + USDC Tracker Running (PER TX, NO MERGE)");
