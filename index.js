@@ -4,7 +4,7 @@ const axios = require("axios");
 require("dotenv").config();
 
 /* ================= CONFIG ================= */
-const WS_RPC_URL = process.env.WS_RPC_URL; // Example: wss://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619
+const WS_RPC_URL = process.env.WS_RPC_URL; // Example: https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
 const CHAT_IDS = process.env.CHAT_IDS.split(",");
@@ -19,7 +19,7 @@ const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 
 /* ================= STATE ================= */
 const processedSignatures = new Set();
-const MAX_SIG_CACHE = 3000;
+const MAX_SIG_CACHE = 5000; // Keeps a cache of processed transactions
 let priceCache = { SOL: 0, USDT: 1, USDC: 1, ts: 0 };
 let isSending = false;
 
@@ -50,6 +50,7 @@ async function getPrices() {
 async function sendAlert(type, amount, sig) {
   if (isSending) return;
   isSending = true;
+
   const prices = await getPrices();
   const usd = (amount * prices[type]).toFixed(2);
 
@@ -76,9 +77,7 @@ async function sendAlert(type, amount, sig) {
   isSending = false;
 }
 
-/* ================= WEBSOCKET CONNECTION ================= */
-const connection = new Connection(WS_RPC_URL, "confirmed");
-
+/* ================= PROCESS TRANSACTION ================= */
 async function processTx(signature) {
   if (processedSignatures.has(signature)) return;
   processedSignatures.add(signature);
@@ -106,29 +105,34 @@ async function processTx(signature) {
     const mint = ix.parsed.info.mint;
     const amount = Number(ix.parsed.info.amount) / 1e6;
 
-    if (amount < MIN_AMOUNT.USDT && mint === USDT_MINT) continue;
-    if (amount < MIN_AMOUNT.USDC && mint === USDC_MINT) continue;
-
-    if (mint === USDT_MINT) await sendAlert("USDT", amount, signature);
-    if (mint === USDC_MINT) await sendAlert("USDC", amount, signature);
+    if (mint === USDT_MINT && amount >= MIN_AMOUNT.USDT) await sendAlert("USDT", amount, signature);
+    if (mint === USDC_MINT && amount >= MIN_AMOUNT.USDC) await sendAlert("USDC", amount, signature);
   }
 }
 
 /* ================= WEBSOCKET SUBSCRIBE ================= */
-async function subscribeWallet() {
-  const sub = connection.onLogs(
-    new PublicKey(WALLET),
-    async (logInfo) => {
-      try {
-        const signature = logInfo.signature;
-        await processTx(signature);
-      } catch (err) {
-        console.log("⚠️ WS log processing error:", err.message);
-      }
-    },
-    "confirmed"
-  );
-  console.log("🚀 WebSocket wallet subscription started");
+let connection;
+let subscriptionId;
+
+async function connectWebSocket() {
+  try {
+    connection = new Connection(WS_RPC_URL, "confirmed");
+    subscriptionId = await connection.onLogs(
+      new PublicKey(WALLET),
+      async logInfo => {
+        try {
+          await processTx(logInfo.signature);
+        } catch (err) {
+          console.log("⚠️ WS log processing error:", err.message);
+        }
+      },
+      "confirmed"
+    );
+    console.log("🚀 WebSocket connected and listening for transactions...");
+  } catch (err) {
+    console.log("⚠️ WebSocket connection error:", err.message);
+    setTimeout(connectWebSocket, 5000); // Retry after 5 seconds
+  }
 }
 
 /* ================= TEST COMMANDS ================= */
@@ -138,6 +142,6 @@ bot.onText(/\/test_usdc/, msg => sendAlert("USDC", 250, "TEST_USDC"));
 
 /* ================= START ================= */
 (async () => {
-  console.log("🚀 SOL + USDT + USDC Tracker Running (WebSocket Real-Time)");
-  await subscribeWallet();
+  console.log("🚀 SOL + USDT + USDC Tracker Running (WebSocket + Fail-Safe)");
+  await connectWebSocket();
 })();
