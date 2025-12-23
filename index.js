@@ -4,41 +4,30 @@ const axios = require('axios');
 require('dotenv').config();
 
 /* ================= CONFIG ================= */
+const WS_URL = "wss://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
+const connection = new Connection(WS_URL, "confirmed");
 
-const RPC_URL =
-  "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
-
-const connection = new Connection(RPC_URL, "confirmed");
-
-/* 🚫 NO POLLING = NO 429 */
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
-
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const CHAT_IDS = process.env.CHAT_IDS.split(',');
-const WALLET = new PublicKey(process.env.WALLET_ADDRESS);
+const WALLET = process.env.WALLET_ADDRESS;
 
 const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-const CHECK_INTERVAL = 15000;
-const MIN_AMOUNT = 1;
-
-const LOGO_URL =
-  "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
-
+const LOGO_URL = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 
+const MIN_AMOUNT = 1; // Minimum tx amount to alert
+
 /* ================= STATE ================= */
-
 const processedSignatures = new Set();
-const MAX_CACHE = 5000;
+const MAX_SIG_CACHE = 5000;
+let priceCache = { SOL: 0, USDT: 1, USDC: 1, ts: 0 };
+let isSending = false;
 
-let priceCache = { ts: 0, SOL: 0, USDT: 1, USDC: 1 };
-let scanning = false;
-
-/* ================= PRICE (CACHED) ================= */
-
+/* ================= PRICE FETCH ================= */
 async function getPrices() {
-  if (Date.now() - priceCache.ts < 60000) return priceCache;
+  if (Date.now() - priceCache.ts < 60000) return priceCache; // cache 1 min
 
   try {
     const res = await axios.get(
@@ -55,14 +44,18 @@ async function getPrices() {
       USDC: 1,
       ts: Date.now()
     };
-  } catch {}
+  } catch (err) {
+    console.log("⚠️ Failed to fetch prices, using cached values");
+  }
 
   return priceCache;
 }
 
-/* ================= SEND ALERT ================= */
-
+/* ================= ALERT FUNCTION ================= */
 async function sendAlert(type, amount, sig) {
+  if (isSending) return;
+  isSending = true;
+
   const prices = await getPrices();
   const usd = (amount * prices[type]).toFixed(2);
 
@@ -80,48 +73,35 @@ async function sendAlert(type, amount, sig) {
         caption,
         parse_mode: "HTML"
       });
-      await new Promise(r => setTimeout(r, 1200)); // Telegram safe throttle
+      await new Promise(r => setTimeout(r, 1200)); // THROTTLE
     } catch {
       await bot.sendMessage(chat, caption, { parse_mode: "HTML" });
     }
   }
 
-  console.log(`✅ ${type} alert sent: ${amount}`);
+  console.log(`✅ ${type} alert: ${amount}`);
+  isSending = false;
 }
 
-/* ================= SCAN TXs ================= */
+/* ================= WEBSOCKET LISTENER ================= */
+async function startWebSocket() {
+  connection.onLogs(new PublicKey(WALLET), async (logs, ctx) => {
+    try {
+      const sig = ctx.signature;
+      if (processedSignatures.has(sig)) return;
 
-async function scan() {
-  if (scanning) return;
-  scanning = true;
-
-  try {
-    const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 25 });
-
-    for (const s of sigs) {
-      if (processedSignatures.has(s.signature)) continue;
-      processedSignatures.add(s.signature);
-
-      if (processedSignatures.size > MAX_CACHE) {
+      processedSignatures.add(sig);
+      if (processedSignatures.size > MAX_SIG_CACHE)
         processedSignatures.delete(processedSignatures.values().next().value);
-      }
 
-      const tx = await connection.getParsedTransaction(s.signature, {
-        maxSupportedTransactionVersion: 0
-      });
+      const tx = await connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
+      if (!tx || !tx.meta) return;
 
-      if (!tx || !tx.meta) continue;
+      // SOL INCOMING
+      const solDiff = (tx.meta.postBalances[0] - tx.meta.preBalances[0]) / LAMPORTS_PER_SOL;
+      if (solDiff >= MIN_AMOUNT) await sendAlert("SOL", solDiff, sig);
 
-      /* ===== SOL ===== */
-      const solDiff =
-        (tx.meta.postBalances[0] - tx.meta.preBalances[0]) /
-        LAMPORTS_PER_SOL;
-
-      if (solDiff >= MIN_AMOUNT) {
-        await sendAlert("SOL", solDiff, s.signature);
-      }
-
-      /* ===== TOKENS ===== */
+      // TOKENS INCOMING
       const instructions = [
         ...(tx.transaction.message.instructions || []),
         ...(tx.meta.innerInstructions || []).flatMap(i => i.instructions)
@@ -130,31 +110,27 @@ async function scan() {
       for (const ix of instructions) {
         if (ix.program !== "spl-token") continue;
         if (ix.parsed?.type !== "transfer") continue;
-        if (ix.parsed.info.destination !== WALLET.toString()) continue;
+        if (ix.parsed.info.destination !== WALLET) continue;
 
         const mint = ix.parsed.info.mint;
-        const amount = Number(ix.parsed.info.amount) / 1e6;
+        const amount = Number(ix.parsed.info.amount) / 1e6; // 6 decimals
 
         if (amount < MIN_AMOUNT) continue;
 
-        if (mint === USDT_MINT)
-          await sendAlert("USDT", amount, s.signature);
-
-        if (mint === USDC_MINT)
-          await sendAlert("USDC", amount, s.signature);
+        if (mint === USDT_MINT) await sendAlert("USDT", amount, sig);
+        if (mint === USDC_MINT) await sendAlert("USDC", amount, sig);
       }
+    } catch (err) {
+      console.log("⚠️ WebSocket scan error:", err.message);
     }
-  } catch (e) {
-    console.error("Scan error:", e.message);
-  } finally {
-    scanning = false;
-  }
+  });
 }
 
-/* ================= LOOP ================= */
-
-setInterval(scan, CHECK_INTERVAL);
+/* ================= TEST COMMANDS ================= */
+bot.onText(/\/test_sol/, msg => sendAlert("SOL", 5.4321, "TEST_SOL"));
+bot.onText(/\/test_usdt/, msg => sendAlert("USDT", 123.4567, "TEST_USDT"));
+bot.onText(/\/test_usdc/, msg => sendAlert("USDC", 250.0, "TEST_USDC"));
 
 /* ================= START ================= */
-
-console.log("🚀 SOL + USDT + USDC Tracker Running (CLEAN)");
+console.log("🚀 SOL + USDT + USDC Tracker Running (CLEAN, WebSocket)");
+startWebSocket();
