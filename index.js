@@ -5,9 +5,10 @@ require('dotenv').config();
 
 /* ================= CONFIG ================= */
 
-const RPC_URL = "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
-const connection = new Connection(RPC_URL, "confirmed");
+const RPC_URL =
+  "https://tame-light-tab.solana-mainnet.quiknode.pro/ad61b3223f4d19dd02b5373b2843318e8c3ea619/";
 
+const connection = new Connection(RPC_URL, "confirmed");
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
 const CHAT_IDS = process.env.CHAT_IDS.split(',');
@@ -19,18 +20,20 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const CHECK_INTERVAL = 15000;
 const MIN_AMOUNT = 1;
 
-const LOGO_URL = "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
+const LOGO_URL =
+  "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
 
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 
 /* ================= STATE ================= */
 
 const processedSignatures = new Set();
-const MAX_SIG_CACHE = 2000;
+const MAX_SIG_CACHE = 3000;
 
 let priceCache = { SOL: 0, USDT: 1, USDC: 1, ts: 0 };
+let isSending = false;
 
-/* ================= PRICE (SAFE) ================= */
+/* ================= PRICE (CACHED) ================= */
 
 async function getPrices() {
   if (Date.now() - priceCache.ts < 60000) return priceCache;
@@ -55,9 +58,12 @@ async function getPrices() {
   return priceCache;
 }
 
-/* ================= ALERT ================= */
+/* ================= SAFE SEND ================= */
 
 async function sendAlert(type, amount, sig) {
+  if (isSending) return;
+  isSending = true;
+
   const prices = await getPrices();
   const usd = (amount * prices[type]).toFixed(2);
 
@@ -75,21 +81,23 @@ async function sendAlert(type, amount, sig) {
         caption,
         parse_mode: "HTML"
       });
+      await new Promise(r => setTimeout(r, 1200)); // HARD throttle
     } catch {
       await bot.sendMessage(chat, caption, { parse_mode: "HTML" });
     }
   }
 
   console.log(`✅ ${type} alert: ${amount}`);
+  isSending = false;
 }
 
-/* ================= CORE SCAN ================= */
+/* ================= TX SCAN ================= */
 
 async function scan() {
   try {
     const sigs = await connection.getSignaturesForAddress(
       new PublicKey(WALLET),
-      { limit: 15 }
+      { limit: 20 }
     );
 
     for (const s of sigs) {
@@ -102,36 +110,29 @@ async function scan() {
       const tx = await connection.getParsedTransaction(s.signature, {
         maxSupportedTransactionVersion: 0
       });
-
       if (!tx || !tx.meta) continue;
 
-      /* ===== SOL ===== */
+      /* SOL */
       const solDiff =
         (tx.meta.postBalances[0] - tx.meta.preBalances[0]) /
         LAMPORTS_PER_SOL;
 
-      if (solDiff >= MIN_AMOUNT) {
+      if (solDiff >= MIN_AMOUNT)
         await sendAlert("SOL", solDiff, s.signature);
-      }
 
-      /* ===== TOKEN TRANSFERS (PER INSTRUCTION) ===== */
+      /* TOKENS */
       const instructions = [
         ...(tx.transaction.message.instructions || []),
         ...(tx.meta.innerInstructions || []).flatMap(i => i.instructions)
       ];
 
       for (const ix of instructions) {
-        if (
-          ix.program !== "spl-token" ||
-          ix.parsed?.type !== "transfer"
-        ) continue;
-
+        if (ix.program !== "spl-token") continue;
+        if (ix.parsed?.type !== "transfer") continue;
         if (ix.parsed.info.destination !== WALLET) continue;
 
         const mint = ix.parsed.info.mint;
-        const amount =
-          Number(ix.parsed.info.amount) /
-          (mint === USDT_MINT || mint === USDC_MINT ? 1e6 : 1);
+        const amount = Number(ix.parsed.info.amount) / 1e6;
 
         if (amount < MIN_AMOUNT) continue;
 
@@ -149,12 +150,20 @@ async function scan() {
 
 setInterval(scan, CHECK_INTERVAL);
 
-/* ================= TEST ================= */
+/* ================= TEST COMMANDS ================= */
 
-bot.onText(/\/test/, async msg => {
-  await sendAlert("USDT", 123.4567, "TEST_TX_HASH");
-});
+bot.onText(/\/test_sol/, msg =>
+  sendAlert("SOL", 5.4321, "TEST_SOL")
+);
+
+bot.onText(/\/test_usdt/, msg =>
+  sendAlert("USDT", 123.4567, "TEST_USDT")
+);
+
+bot.onText(/\/test_usdc/, msg =>
+  sendAlert("USDC", 250.0, "TEST_USDC")
+);
 
 /* ================= START ================= */
 
-console.log("🚀 SOL + USDT + USDC Tracker Running (PER TX, NO MERGE)");
+console.log("🚀 SOL + USDT + USDC Tracker Running (STABLE)");
