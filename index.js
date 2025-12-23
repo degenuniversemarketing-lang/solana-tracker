@@ -19,7 +19,7 @@ const MIN_SOL = Number(process.env.MIN_ALERT_SOL || 0.01);
 const MIN_TOKEN = Number(process.env.MIN_ALERT_TOKEN || 1);
 
 const LOGO =
-  "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
+  "https://i.postimg.cc/5NpFMTry/Whats-App-Image-2025-12-21-at-1-29-09-AM.jpg";
 
 /* ================= CMC ================= */
 
@@ -33,15 +33,11 @@ const PRICE_TTL = 60_000;
 const TOKENS = {
   SOL: { symbol: "SOL" },
   USDT: {
-    mint: new PublicKey(
-      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-    ),
+    mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
     decimals: 6
   },
   USDC: {
-    mint: new PublicKey(
-      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-    ),
+    mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
     decimals: 6
   }
 };
@@ -49,16 +45,15 @@ const TOKENS = {
 /* ================= STATE ================= */
 
 const seenTx = new Set();
+const alertQueue = [];
+let sending = false;
+let scanning = false;
 
 /* ================= PRICE ================= */
 
 async function getPrice(symbol) {
-  if (
-    priceCache[symbol] &&
-    Date.now() - priceCache[symbol].time < PRICE_TTL
-  ) {
+  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL)
     return priceCache[symbol].price;
-  }
 
   try {
     const res = await axios.get(
@@ -77,19 +72,24 @@ async function getPrice(symbol) {
   }
 }
 
-/* ================= ALERT ================= */
+/* ================= ALERT QUEUE ================= */
 
-async function sendAlert(title, amount, symbol, tx) {
-  const price = await getPrice(symbol);
-  const usd = amount * price;
+async function processQueue() {
+  if (sending || alertQueue.length === 0) return;
+
+  sending = true;
+  const job = alertQueue.shift();
+
+  const price = await getPrice(job.symbol);
+  const usd = job.amount * price;
 
   const caption = `
-🚨 <b>${title}</b>
+🚨 <b>New Buy Alert!</b>
 
-💰 <b>${amount.toFixed(4)} ${symbol}</b>
+💰 <b>${job.amount.toFixed(4)} ${job.symbol}</b>
 💵 <b>$${usd.toFixed(2)} USD</b>
 
-🔗 <a href="https://solscan.io/tx/${tx}">View Transaction</a>
+🔗 <a href="https://solscan.io/tx/${job.tx}">View Transaction</a>
 `.trim();
 
   for (const chat of CHAT_IDS) {
@@ -98,11 +98,19 @@ async function sendAlert(title, amount, symbol, tx) {
         caption,
         parse_mode: "HTML"
       });
-      await new Promise(r => setTimeout(r, 900));
+      await new Promise(r => setTimeout(r, 1200)); // HARD RATE LIMIT
     } catch (e) {
       console.log("Telegram error:", e.message);
     }
   }
+
+  sending = false;
+  processQueue();
+}
+
+function enqueueAlert(amount, symbol, tx) {
+  alertQueue.push({ amount, symbol, tx });
+  processQueue();
 }
 
 /* ================= SOL SCAN ================= */
@@ -116,17 +124,15 @@ async function scanSOL() {
     const tx = await connection.getParsedTransaction(sig.signature, {
       maxSupportedTransactionVersion: 0
     });
-
     if (!tx) continue;
 
     const pre = tx.meta?.preBalances[0] || 0;
     const post = tx.meta?.postBalances[0] || 0;
-
     const diff = (post - pre) / LAMPORTS_PER_SOL;
 
     if (diff >= MIN_SOL) {
       seenTx.add(sig.signature);
-      await sendAlert("SOL Transfer", diff, "SOL", sig.signature);
+      enqueueAlert(diff, "SOL", sig.signature);
     }
   }
 }
@@ -137,14 +143,10 @@ async function scanToken(symbol, mint, decimals) {
   const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, {
     mint
   });
-
   if (!accounts.value.length) return;
 
-  const tokenAccount = new PublicKey(accounts.value[0].pubkey);
-
-  const sigs = await connection.getSignaturesForAddress(tokenAccount, {
-    limit: 5
-  });
+  const tokenAcc = new PublicKey(accounts.value[0].pubkey);
+  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 5 });
 
   for (const sig of sigs) {
     if (seenTx.has(sig.signature)) continue;
@@ -152,7 +154,6 @@ async function scanToken(symbol, mint, decimals) {
     const tx = await connection.getParsedTransaction(sig.signature, {
       maxSupportedTransactionVersion: 0
     });
-
     if (!tx) continue;
 
     const instructions = [
@@ -164,14 +165,14 @@ async function scanToken(symbol, mint, decimals) {
       if (
         ix.program === "spl-token" &&
         ix.parsed?.type === "transfer" &&
-        ix.parsed.info.destination === tokenAccount.toString()
+        ix.parsed.info.destination === tokenAcc.toString()
       ) {
         const amount =
           Number(ix.parsed.info.amount) / Math.pow(10, decimals);
 
         if (amount >= MIN_TOKEN) {
           seenTx.add(sig.signature);
-          await sendAlert(`${symbol} Transfer`, amount, symbol, sig.signature);
+          enqueueAlert(amount, symbol, sig.signature);
           break;
         }
       }
@@ -181,32 +182,26 @@ async function scanToken(symbol, mint, decimals) {
 
 /* ================= LOOP ================= */
 
-async function start() {
-  console.log("🚀 SOL + USDT + USDC Tracker Running (USD enabled)");
+async function loop() {
+  if (scanning) return;
+  scanning = true;
 
-  setInterval(async () => {
-    try {
-      await scanSOL();
-      await scanToken("USDT", TOKENS.USDT.mint, TOKENS.USDT.decimals);
-      await scanToken("USDC", TOKENS.USDC.mint, TOKENS.USDC.decimals);
-    } catch (e) {
-      console.log("Scan error:", e.message);
-    }
-  }, CHECK_INTERVAL);
+  try {
+    await scanSOL();
+    await scanToken("USDT", TOKENS.USDT.mint, TOKENS.USDT.decimals);
+    await scanToken("USDC", TOKENS.USDC.mint, TOKENS.USDC.decimals);
+  } catch (e) {
+    console.log("Scan error:", e.message);
+  }
+
+  scanning = false;
 }
 
-start();
+console.log("🚀 SOL + USDT + USDC Tracker Running (USD enabled)");
+setInterval(loop, CHECK_INTERVAL);
 
-/* ================= TEST COMMANDS ================= */
+/* ================= TEST ================= */
 
-bot.onText(/\/test_sol/, () => {
-  sendAlert("SOL Test Alert", 12.5, "SOL", "test_tx");
-});
-
-bot.onText(/\/test_usdt/, () => {
-  sendAlert("USDT Test Alert", 500, "USDT", "test_tx");
-});
-
-bot.onText(/\/test_usdc/, () => {
-  sendAlert("USDC Test Alert", 1000, "USDC", "test_tx");
+bot.onText(/\/test/, () => {
+  enqueueAlert(500, "USDT", "test_tx");
 });
