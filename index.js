@@ -4,7 +4,7 @@ const axios = require("axios");
 require("dotenv").config();
 
 /* ================= CONFIG ================= */
-const RPC = "https://ultra-sleek-friday.solana-mainnet.quiknode.pro/52dd5e4af8e55ddaff91cbcad5b5e72dfd7d5d2a";
+const RPC = "https://ultra-sleek-friday.solana-mainnet.quiknode.pro/52dd5e4af8e55ddaff91cbcad5b5e72dfd7d5d2a/";
 const connection = new Connection(RPC, "confirmed");
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
@@ -16,31 +16,22 @@ const MIN_SOL = Number(process.env.MIN_ALERT_SOL || 0.01);
 const MIN_TOKEN = Number(process.env.MIN_ALERT_TOKEN || 1);
 
 const LOGO = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
-
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
-const PRICE_TTL = 60_000;
 
 /* ================= TOKENS ================= */
 const TOKENS = {
-  SOL: { symbol: "SOL" },
-  USDT: {
-    mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
-    decimals: 6
-  },
-  USDC: {
-    mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-    decimals: 6
-  }
+  USDT: { mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), decimals: 6 },
+  USDC: { mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), decimals: 6 }
 };
 
 /* ================= STATE ================= */
-const processedSignatures = new Set(); // <--- stores all processed txs
-const MAX_SIG_CACHE = 5000; // keep memory safe
+const seenTx = new Set();
 const alertQueue = [];
 let sending = false;
 let scanning = false;
 
 const priceCache = {};
+const PRICE_TTL = 60_000;
 
 /* ================= PRICE ================= */
 async function getPrice(symbol) {
@@ -48,14 +39,10 @@ async function getPrice(symbol) {
     return priceCache[symbol].price;
 
   try {
-    const res = await axios.get(
-      "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
-      {
-        headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
-        params: { symbol, convert: "USD" }
-      }
-    );
-
+    const res = await axios.get("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest", {
+      headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
+      params: { symbol, convert: "USD" }
+    });
     const price = res.data.data[symbol].quote.USD.price;
     priceCache[symbol] = { price, time: Date.now() };
     return price;
@@ -67,10 +54,9 @@ async function getPrice(symbol) {
 /* ================= ALERT QUEUE ================= */
 async function processQueue() {
   if (sending || alertQueue.length === 0) return;
-
   sending = true;
-  const job = alertQueue.shift();
 
+  const job = alertQueue.shift();
   const price = await getPrice(job.symbol);
   const usd = job.amount * price;
 
@@ -85,13 +71,9 @@ async function processQueue() {
 
   for (const chat of CHAT_IDS) {
     try {
-      await bot.sendPhoto(chat, LOGO, {
-        caption,
-        parse_mode: "HTML"
-      });
-      await new Promise(r => setTimeout(r, 1200)); // throttling
-    } catch (e) {
-      console.log("Telegram error:", e.message);
+      await bot.sendPhoto(chat, LOGO, { caption, parse_mode: "HTML" });
+      await new Promise(r => setTimeout(r, 1200));
+    } catch {
       await bot.sendMessage(chat, caption, { parse_mode: "HTML" });
     }
   }
@@ -101,67 +83,62 @@ async function processQueue() {
 }
 
 function enqueueAlert(amount, symbol, tx) {
-  if (!processedSignatures.has(tx)) {
-    processedSignatures.add(tx);
-    // keep set limited
-    if (processedSignatures.size > MAX_SIG_CACHE) {
-      const first = processedSignatures.values().next().value;
-      processedSignatures.delete(first);
-    }
-    alertQueue.push({ amount, symbol, tx });
-    processQueue();
-  }
+  alertQueue.push({ amount, symbol, tx });
+  seenTx.add(tx);
+  processQueue();
 }
 
 /* ================= SOL SCAN ================= */
 async function scanSOL() {
-  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 20 });
-  sigs.reverse(); // process oldest first
+  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 10 });
+  for (const sig of sigs.reverse()) { // oldest first
+    if (seenTx.has(sig.signature)) continue;
 
-  for (const s of sigs) {
-    if (processedSignatures.has(s.signature)) continue;
+    const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
+    if (!tx) continue;
 
-    const tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx || !tx.meta) continue;
+    const pre = tx.meta?.preBalances[0] || 0;
+    const post = tx.meta?.postBalances[0] || 0;
+    const diff = (post - pre) / LAMPORTS_PER_SOL;
 
-    const diff = (tx.meta.postBalances[0] - tx.meta.preBalances[0]) / LAMPORTS_PER_SOL;
-    if (diff >= MIN_SOL) enqueueAlert(diff, "SOL", s.signature);
+    if (diff >= MIN_SOL) enqueueAlert(diff, "SOL", sig.signature);
   }
 }
 
 /* ================= TOKEN SCAN ================= */
 async function scanToken(symbol, token) {
   const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, { mint: token.mint });
-  if (!accounts.value.length) return;
+  for (const acc of accounts.value) {
+    const tokenAcc = new PublicKey(acc.pubkey);
+    const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 10 });
 
-  const tokenAcc = new PublicKey(accounts.value[0].pubkey);
-  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 20 });
-  sigs.reverse();
+    for (const sig of sigs.reverse()) { // oldest first
+      if (seenTx.has(sig.signature)) continue;
 
-  for (const s of sigs) {
-    if (processedSignatures.has(s.signature)) continue;
+      const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
+      if (!tx) continue;
 
-    const tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx || !tx.meta) continue;
+      const instructions = [
+        ...tx.transaction.message.instructions,
+        ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
+      ];
 
-    const instructions = [
-      ...tx.transaction.message.instructions,
-      ...(tx.meta.innerInstructions || []).flatMap(i => i.instructions)
-    ];
-
-    for (const ix of instructions) {
-      if (ix.program === "spl-token" && ix.parsed?.type === "transfer") {
-        if (ix.parsed.info.destination !== tokenAcc.toString()) continue;
-
-        const amount = Number(ix.parsed.info.amount) / 10 ** token.decimals;
-        if (amount >= MIN_TOKEN) enqueueAlert(amount, symbol, s.signature);
-        break;
+      for (const ix of instructions) {
+        if (
+          ix.program === "spl-token" &&
+          ix.parsed?.type === "transfer" &&
+          ix.parsed.info.destination === tokenAcc.toString()
+        ) {
+          const amount = Number(ix.parsed.info.amount) / Math.pow(10, token.decimals);
+          if (amount >= MIN_TOKEN) enqueueAlert(amount, symbol, sig.signature);
+          break;
+        }
       }
     }
   }
 }
 
-/* ================= MAIN LOOP ================= */
+/* ================= LOOP ================= */
 async function loop() {
   if (scanning) return;
   scanning = true;
@@ -181,6 +158,6 @@ console.log("🚀 SOL + USDT + USDC Tracker Running (HTTPS Polling, USD enabled)
 setInterval(loop, CHECK_INTERVAL);
 
 /* ================= TEST ================= */
-bot.onText(/\/test_sol/, () => enqueueAlert(1.23, "SOL", "TEST_SOL"));
-bot.onText(/\/test_usdt/, () => enqueueAlert(123.45, "USDT", "TEST_USDT"));
-bot.onText(/\/test_usdc/, () => enqueueAlert(250, "USDC", "TEST_USDC"));
+bot.onText(/\/test_sol/, () => enqueueAlert(0.1234, "SOL", "TEST_SOL"));
+bot.onText(/\/test_usdt/, () => enqueueAlert(123.4567, "USDT", "TEST_USDT"));
+bot.onText(/\/test_usdc/, () => enqueueAlert(250.0, "USDC", "TEST_USDC"));
