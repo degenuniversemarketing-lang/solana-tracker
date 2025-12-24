@@ -26,11 +26,11 @@ const TOKENS = {
 };
 
 /* ================= STATE ================= */
-const seenTx = new Set();
 const alertQueue = [];
 let sending = false;
 let scanning = false;
 let initialized = false;
+const seenTx = new Set(); // only store txs **since bot start** (no previous txs)
 
 /* ================= PRICE CACHE ================= */
 const priceCache = {};
@@ -48,7 +48,7 @@ async function getPrice(symbol) {
     const price = symbol === "SOL" ? res.data.data.SOL.quote.USD.price : 1;
     priceCache[symbol] = { price, time: Date.now() };
     return price;
-  } catch (e) {
+  } catch {
     return symbol === "SOL" ? 0 : 1;
   }
 }
@@ -74,7 +74,7 @@ async function processQueue() {
   for (const chat of CHAT_IDS) {
     try {
       await bot.sendPhoto(chat, LOGO, { caption, parse_mode: "HTML" });
-      await new Promise(r => setTimeout(r, 1200));
+      await new Promise(r => setTimeout(r, 1200)); // rate-limit
     } catch {
       await bot.sendMessage(chat, caption, { parse_mode: "HTML" });
     }
@@ -89,22 +89,11 @@ function enqueueAlert(amount, symbol, tx) {
   processQueue();
 }
 
-/* ================= INITIALIZE (IGNORE OLD TXS) ================= */
-async function initializeSeenTx() {
-  try {
-    const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 50 });
-    for (const sig of sigs) seenTx.add(sig.signature);
-    initialized = true;
-    console.log(`✅ Initialization complete. Ignoring ${sigs.length} previous transactions.`);
-  } catch (e) {
-    console.log("Initialization error:", e.message);
-  }
-}
-
-/* ================= SOL SCAN ================= */
+/* ================= SCAN FUNCTIONS ================= */
 async function scanSOL() {
   const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 10 });
-  for (const sig of sigs) {
+
+  for (const sig of sigs.reverse()) { // reverse to process oldest first
     if (seenTx.has(sig.signature)) continue;
 
     const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
@@ -121,14 +110,13 @@ async function scanSOL() {
   }
 }
 
-/* ================= TOKEN SCAN ================= */
 async function scanToken(symbol, { mint, decimals }) {
   const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, { mint });
   if (!accounts.value.length) return;
   const tokenAcc = new PublicKey(accounts.value[0].pubkey);
   const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 10 });
 
-  for (const sig of sigs) {
+  for (const sig of sigs.reverse()) { // reverse to process oldest first
     if (seenTx.has(sig.signature)) continue;
 
     const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
@@ -158,11 +146,6 @@ async function scanToken(symbol, { mint, decimals }) {
 
 /* ================= LOOP ================= */
 async function loop() {
-  if (!initialized) {
-    await initializeSeenTx();
-    return;
-  }
-
   if (scanning) return;
   scanning = true;
 
@@ -178,10 +161,11 @@ async function loop() {
 }
 
 /* ================= START ================= */
-console.log("🚀 SOL + USDT + USDC Tracker Running (HTTPS Polling, USD enabled)");
+console.log("🚀 SOL + USDT + USDC Tracker Running (Only New TXs, USD enabled)");
+initialized = true; // ignore all previous txs
 setInterval(loop, CHECK_INTERVAL);
 
-/* ================= TEST COMMANDS ================= */
+/* ================= TEST ================= */
 bot.onText(/\/test_sol/, () => enqueueAlert(1, "SOL", "TEST_TX"));
 bot.onText(/\/test_usdt/, () => enqueueAlert(500, "USDT", "TEST_TX"));
 bot.onText(/\/test_usdc/, () => enqueueAlert(1000, "USDC", "TEST_TX"));
