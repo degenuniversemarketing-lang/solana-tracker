@@ -24,7 +24,6 @@ const LOGO =
 /* ================= CMC ================= */
 
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
-
 const priceCache = {};
 const PRICE_TTL = 60_000;
 
@@ -76,10 +75,9 @@ async function getPrice(symbol) {
 
 async function processQueue() {
   if (sending || alertQueue.length === 0) return;
-
   sending = true;
-  const job = alertQueue.shift();
 
+  const job = alertQueue.shift();
   const price = await getPrice(job.symbol);
   const usd = job.amount * price;
 
@@ -98,7 +96,7 @@ async function processQueue() {
         caption,
         parse_mode: "HTML"
       });
-      await new Promise(r => setTimeout(r, 1200)); // HARD RATE LIMIT
+      await new Promise((r) => setTimeout(r, 1200)); // HARD RATE LIMIT
     } catch (e) {
       console.log("Telegram error:", e.message);
     }
@@ -116,9 +114,10 @@ function enqueueAlert(amount, symbol, tx) {
 /* ================= SOL SCAN ================= */
 
 async function scanSOL() {
-  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 5 });
+  // fetch last 50 signatures to avoid missing big txns
+  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 50 });
 
-  for (const sig of sigs) {
+  for (const sig of sigs.reverse()) {
     if (seenTx.has(sig.signature)) continue;
 
     const tx = await connection.getParsedTransaction(sig.signature, {
@@ -146,9 +145,9 @@ async function scanToken(symbol, mint, decimals) {
   if (!accounts.value.length) return;
 
   const tokenAcc = new PublicKey(accounts.value[0].pubkey);
-  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 5 });
+  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 50 });
 
-  for (const sig of sigs) {
+  for (const sig of sigs.reverse()) {
     if (seenTx.has(sig.signature)) continue;
 
     const tx = await connection.getParsedTransaction(sig.signature, {
@@ -158,7 +157,7 @@ async function scanToken(symbol, mint, decimals) {
 
     const instructions = [
       ...tx.transaction.message.instructions,
-      ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
+      ...(tx.meta?.innerInstructions || []).flatMap((i) => i.instructions)
     ];
 
     for (const ix of instructions) {
@@ -167,8 +166,7 @@ async function scanToken(symbol, mint, decimals) {
         ix.parsed?.type === "transfer" &&
         ix.parsed.info.destination === tokenAcc.toString()
       ) {
-        const amount =
-          Number(ix.parsed.info.amount) / Math.pow(10, decimals);
+        const amount = Number(ix.parsed.info.amount) / Math.pow(10, decimals);
 
         if (amount >= MIN_TOKEN) {
           seenTx.add(sig.signature);
@@ -197,7 +195,7 @@ async function loop() {
   scanning = false;
 }
 
-console.log("🚀 SOL + USDT + USDC Tracker Running (USD enabled)");
+console.log("🚀 SOL + USDT + USDC Tracker Running (All TXs, USD enabled)");
 setInterval(loop, CHECK_INTERVAL);
 
 /* ================= TEST ================= */
