@@ -21,7 +21,8 @@ const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 /* ================= TOKENS ================= */
 const TOKENS = {
   USDT: { mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), decimals: 6 },
-  USDC: { mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), decimals: 6 }
+  USDC: { mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), decimals: 6 },
+  SOL: { symbol: "SOL" }
 };
 
 /* ================= STATE ================= */
@@ -29,24 +30,25 @@ const seenTx = new Set();
 const alertQueue = [];
 let sending = false;
 let scanning = false;
+let initialized = false;
 
+/* ================= PRICE CACHE ================= */
 const priceCache = {};
 const PRICE_TTL = 60_000;
 
-/* ================= PRICE ================= */
 async function getPrice(symbol) {
-  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL)
+  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL) {
     return priceCache[symbol].price;
-
+  }
   try {
     const res = await axios.get("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest", {
       headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
       params: { symbol, convert: "USD" }
     });
-    const price = res.data.data[symbol].quote.USD.price;
+    const price = symbol === "SOL" ? res.data.data.SOL.quote.USD.price : 1;
     priceCache[symbol] = { price, time: Date.now() };
     return price;
-  } catch {
+  } catch (e) {
     return symbol === "SOL" ? 0 : 1;
   }
 }
@@ -55,8 +57,8 @@ async function getPrice(symbol) {
 async function processQueue() {
   if (sending || alertQueue.length === 0) return;
   sending = true;
-
   const job = alertQueue.shift();
+
   const price = await getPrice(job.symbol);
   const usd = job.amount * price;
 
@@ -84,14 +86,25 @@ async function processQueue() {
 
 function enqueueAlert(amount, symbol, tx) {
   alertQueue.push({ amount, symbol, tx });
-  seenTx.add(tx);
   processQueue();
+}
+
+/* ================= INITIALIZE (IGNORE OLD TXS) ================= */
+async function initializeSeenTx() {
+  try {
+    const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 50 });
+    for (const sig of sigs) seenTx.add(sig.signature);
+    initialized = true;
+    console.log(`✅ Initialization complete. Ignoring ${sigs.length} previous transactions.`);
+  } catch (e) {
+    console.log("Initialization error:", e.message);
+  }
 }
 
 /* ================= SOL SCAN ================= */
 async function scanSOL() {
   const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 10 });
-  for (const sig of sigs.reverse()) { // oldest first
+  for (const sig of sigs) {
     if (seenTx.has(sig.signature)) continue;
 
     const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
@@ -101,36 +114,41 @@ async function scanSOL() {
     const post = tx.meta?.postBalances[0] || 0;
     const diff = (post - pre) / LAMPORTS_PER_SOL;
 
-    if (diff >= MIN_SOL) enqueueAlert(diff, "SOL", sig.signature);
+    if (diff >= MIN_SOL) {
+      seenTx.add(sig.signature);
+      enqueueAlert(diff, "SOL", sig.signature);
+    }
   }
 }
 
 /* ================= TOKEN SCAN ================= */
-async function scanToken(symbol, token) {
-  const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, { mint: token.mint });
-  for (const acc of accounts.value) {
-    const tokenAcc = new PublicKey(acc.pubkey);
-    const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 10 });
+async function scanToken(symbol, { mint, decimals }) {
+  const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, { mint });
+  if (!accounts.value.length) return;
+  const tokenAcc = new PublicKey(accounts.value[0].pubkey);
+  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 10 });
 
-    for (const sig of sigs.reverse()) { // oldest first
-      if (seenTx.has(sig.signature)) continue;
+  for (const sig of sigs) {
+    if (seenTx.has(sig.signature)) continue;
 
-      const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
-      if (!tx) continue;
+    const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
+    if (!tx) continue;
 
-      const instructions = [
-        ...tx.transaction.message.instructions,
-        ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
-      ];
+    const instructions = [
+      ...tx.transaction.message.instructions,
+      ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
+    ];
 
-      for (const ix of instructions) {
-        if (
-          ix.program === "spl-token" &&
-          ix.parsed?.type === "transfer" &&
-          ix.parsed.info.destination === tokenAcc.toString()
-        ) {
-          const amount = Number(ix.parsed.info.amount) / Math.pow(10, token.decimals);
-          if (amount >= MIN_TOKEN) enqueueAlert(amount, symbol, sig.signature);
+    for (const ix of instructions) {
+      if (
+        ix.program === "spl-token" &&
+        ix.parsed?.type === "transfer" &&
+        ix.parsed.info.destination === tokenAcc.toString()
+      ) {
+        const amount = Number(ix.parsed.info.amount) / Math.pow(10, decimals);
+        if (amount >= MIN_TOKEN) {
+          seenTx.add(sig.signature);
+          enqueueAlert(amount, symbol, sig.signature);
           break;
         }
       }
@@ -140,6 +158,11 @@ async function scanToken(symbol, token) {
 
 /* ================= LOOP ================= */
 async function loop() {
+  if (!initialized) {
+    await initializeSeenTx();
+    return;
+  }
+
   if (scanning) return;
   scanning = true;
 
@@ -154,10 +177,11 @@ async function loop() {
   scanning = false;
 }
 
+/* ================= START ================= */
 console.log("🚀 SOL + USDT + USDC Tracker Running (HTTPS Polling, USD enabled)");
 setInterval(loop, CHECK_INTERVAL);
 
-/* ================= TEST ================= */
-bot.onText(/\/test_sol/, () => enqueueAlert(0.1234, "SOL", "TEST_SOL"));
-bot.onText(/\/test_usdt/, () => enqueueAlert(123.4567, "USDT", "TEST_USDT"));
-bot.onText(/\/test_usdc/, () => enqueueAlert(250.0, "USDC", "TEST_USDC"));
+/* ================= TEST COMMANDS ================= */
+bot.onText(/\/test_sol/, () => enqueueAlert(1, "SOL", "TEST_TX"));
+bot.onText(/\/test_usdt/, () => enqueueAlert(500, "USDT", "TEST_TX"));
+bot.onText(/\/test_usdc/, () => enqueueAlert(1000, "USDC", "TEST_TX"));
