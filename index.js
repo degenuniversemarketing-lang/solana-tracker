@@ -1,37 +1,45 @@
-const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
+const { PublicKey } = require("@solana/web3.js");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const WebSocket = require("ws");
 require("dotenv").config();
 
 /* ================= CONFIG ================= */
 
-// Helium RPC key
-const HELIUM_KEY = "dd897fbc-4cfc-4af9-bded-e7fe74f4450b";
-const RPC = `https://rpc.helius.xyz/?api-key=${HELIUM_KEY}`;
+const HELIUS_WS = "wss://mainnet.helius-rpc.com/?api-key=dd897fbc-4cfc-4af9-bded-e7fe74f4450b";
+const WALLET = process.env.WALLET_ADDRESS;
 
-const connection = new Connection(RPC, "confirmed");
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
-
 const CHAT_IDS = process.env.CHAT_IDS.split(",");
-const WALLET = new PublicKey(process.env.WALLET_ADDRESS);
 
-const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 5000);
-
-// Minimum thresholds
-const MIN_SOL = 1;       // 1 SOL
-const MIN_TOKEN = 1;     // 1 USDT/USDC
-
+const MIN_SOL = Number(process.env.MIN_ALERT_SOL || 1); // 1 SOL min
+const MIN_TOKEN = Number(process.env.MIN_ALERT_TOKEN || 1); // 1 USDT/USDC min
 const LOGO = "https://i.postimg.cc/85VrXsyt/Whats-App-Image-2025-12-23-at-12-19-02-AM.jpg";
-
-/* ================= CMC ================= */
 
 const CMC_API_KEY = "27cd7244e4574e70ad724a5feef7ee10";
 const priceCache = {};
 const PRICE_TTL = 60_000;
 
+/* ================= TOKENS ================= */
+
+const TOKENS = {
+  SOL: { symbol: "SOL" },
+  USDT: { symbol: "USDT", mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 },
+  USDC: { symbol: "USDC", mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6 }
+};
+
+/* ================= STATE ================= */
+
+const seenTx = new Set();
+const alertQueue = [];
+let sending = false;
+
+/* ================= PRICE FETCH ================= */
+
 async function getPrice(symbol) {
-  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL)
+  if (priceCache[symbol] && Date.now() - priceCache[symbol].time < PRICE_TTL) {
     return priceCache[symbol].price;
+  }
 
   try {
     const res = await axios.get(
@@ -41,8 +49,7 @@ async function getPrice(symbol) {
         params: { symbol, convert: "USD" }
       }
     );
-
-    const price = res.data.data[symbol]?.quote?.USD?.price || (symbol === "SOL" ? 0 : 1);
+    const price = res.data.data[symbol].quote.USD.price;
     priceCache[symbol] = { price, time: Date.now() };
     return price;
   } catch {
@@ -50,22 +57,7 @@ async function getPrice(symbol) {
   }
 }
 
-/* ================= TOKENS ================= */
-
-const TOKENS = {
-  SOL: { symbol: "SOL" },
-  USDT: { symbol: "USDT", mint: new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), decimals: 6 },
-  USDC: { symbol: "USDC", mint: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), decimals: 6 }
-};
-
-/* ================= STATE ================= */
-
-const seenTx = new Set();
-const alertQueue = [];
-let sending = false;
-let scanning = false;
-
-/* ================= ALERT QUEUE ================= */
+/* ================= ALERTS ================= */
 
 async function processQueue() {
   if (sending || alertQueue.length === 0) return;
@@ -87,7 +79,7 @@ async function processQueue() {
   for (const chat of CHAT_IDS) {
     try {
       await bot.sendPhoto(chat, LOGO, { caption, parse_mode: "HTML" });
-      await new Promise(r => setTimeout(r, 1200)); // HARD RATE LIMIT
+      await new Promise(r => setTimeout(r, 1200)); // avoid Telegram rate limit
     } catch (e) {
       console.log("Telegram error:", e.message);
     }
@@ -98,88 +90,80 @@ async function processQueue() {
 }
 
 function enqueueAlert(amount, symbol, tx) {
-  alertQueue.push({ amount, symbol, tx });
-  processQueue();
-}
-
-/* ================= SOL SCAN ================= */
-
-async function scanSOL() {
-  const sigs = await connection.getSignaturesForAddress(WALLET, { limit: 50 });
-
-  for (const sig of sigs.reverse()) {
-    if (seenTx.has(sig.signature)) continue;
-
-    const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx) continue;
-
-    const diff = (tx.meta?.postBalances[0] - tx.meta?.preBalances[0]) / LAMPORTS_PER_SOL;
-    if (diff >= MIN_SOL) {
-      seenTx.add(sig.signature);
-      enqueueAlert(diff, "SOL", sig.signature);
-    }
+  if (!seenTx.has(tx)) {
+    seenTx.add(tx);
+    alertQueue.push({ amount, symbol, tx });
+    processQueue();
   }
 }
 
-/* ================= TOKEN SCAN ================= */
+/* ================= HELIUS WS ================= */
 
-async function scanToken(symbol, mint, decimals) {
-  const accounts = await connection.getParsedTokenAccountsByOwner(WALLET, { mint });
-  if (!accounts.value.length) return;
+function initWS() {
+  const ws = new WebSocket(HELIUS_WS);
 
-  const tokenAcc = new PublicKey(accounts.value[0].pubkey);
-  const sigs = await connection.getSignaturesForAddress(tokenAcc, { limit: 50 });
+  ws.on("open", () => {
+    console.log("🔵 Helius WebSocket connected");
 
-  for (const sig of sigs.reverse()) {
-    if (seenTx.has(sig.signature)) continue;
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "subscribe",
+      params: {
+        type: "wallet",
+        address: WALLET,
+        commitment: "confirmed",
+        includeTransactions: true
+      }
+    }));
+  });
 
-    const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx) continue;
+  ws.on("message", async (data) => {
+    const msg = JSON.parse(data);
 
-    const instructions = [
-      ...tx.transaction.message.instructions,
-      ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)
-    ];
+    if (msg.method === "notification" && msg.params?.result?.type === "transaction") {
+      const tx = msg.params.result.signature;
+      const instructions = msg.params.result.transaction.message.instructions;
 
-    for (const ix of instructions) {
-      if (
-        ix.program === "spl-token" &&
-        ix.parsed?.type === "transfer" &&
-        ix.parsed.info.destination === tokenAcc.toString()
-      ) {
-        const amount = Number(ix.parsed.info.amount) / Math.pow(10, decimals);
-        if (amount >= MIN_TOKEN) {
-          seenTx.add(sig.signature);
-          enqueueAlert(amount, symbol, sig.signature);
-          break;
+      for (const ix of instructions) {
+        if (ix.program === "system" && ix.parsed?.type === "transfer") {
+          const solAmount = ix.parsed.info.lamports / 1e9;
+          if (solAmount >= MIN_SOL) enqueueAlert(solAmount, "SOL", tx);
+        }
+
+        if (ix.program === "spl-token" && ix.parsed?.type === "transfer") {
+          const mint = ix.parsed.info.mint;
+          const amount = Number(ix.parsed.info.amount);
+
+          if (mint === TOKENS.USDT.mint && amount / 1e6 >= MIN_TOKEN) {
+            enqueueAlert(amount / 1e6, "USDT", tx);
+          }
+          if (mint === TOKENS.USDC.mint && amount / 1e6 >= MIN_TOKEN) {
+            enqueueAlert(amount / 1e6, "USDC", tx);
+          }
         }
       }
     }
-  }
+  });
+
+  ws.on("close", () => {
+    console.log("⚠️ WebSocket closed, reconnecting in 5s...");
+    setTimeout(initWS, 5000);
+  });
+
+  ws.on("error", (err) => {
+    console.log("WebSocket error:", err.message);
+    ws.close();
+  });
 }
 
-/* ================= LOOP ================= */
+/* ================= INIT ================= */
 
-async function loop() {
-  if (scanning) return;
-  scanning = true;
-
-  try {
-    await scanSOL();
-    await scanToken("USDT", TOKENS.USDT.mint, TOKENS.USDT.decimals);
-    await scanToken("USDC", TOKENS.USDC.mint, TOKENS.USDC.decimals);
-  } catch (e) {
-    console.log("Scan error:", e.message);
-  }
-
-  scanning = false;
-}
-
-console.log("🚀 SOL + USDT + USDC Tracker Running (Big TXNs, Real-time, Helium API)");
-setInterval(loop, CHECK_INTERVAL);
+console.log("🚀 SOL + USDT + USDC Tracker Running (Helius WS, NO DUPES)");
+initWS();
 
 /* ================= TEST COMMAND ================= */
 
-bot.onText(/\/test_sol/, () => enqueueAlert(5, "SOL", "TEST_SOL"));
-bot.onText(/\/test_usdt/, () => enqueueAlert(50, "USDT", "TEST_USDT"));
-bot.onText(/\/test_usdc/, () => enqueueAlert(75, "USDC", "TEST_USDC"));
+bot.onText(/\/test/, () => {
+  enqueueAlert(500, "USDT", "test_tx");
+});
